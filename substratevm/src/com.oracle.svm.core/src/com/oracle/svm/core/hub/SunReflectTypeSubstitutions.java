@@ -191,22 +191,6 @@ final class Target_sun_reflect_generics_reflectiveObjects_WildcardTypeImpl {
     @TargetElement(name = "lowerBounds", onlyWith = JDK11OrLater.class) //
     private Object[] lowerBoundsJDK11OrLater;
 
-    /* The upperBounds value is cached. The upperBoundASTs field is not used at run time. */
-    @Delete //
-    @TargetElement(onlyWith = JDK8OrEarlier.class) //
-    private FieldTypeSignature[] upperBoundASTs;
-    /* The lowerBounds value is cached. The lowerBoundASTs field is not used at run time. */
-    @Delete //
-    @TargetElement(onlyWith = JDK8OrEarlier.class) //
-    private FieldTypeSignature[] lowerBoundASTs;
-
-    @Substitute
-    @SuppressWarnings("unused")
-    private Target_sun_reflect_generics_reflectiveObjects_WildcardTypeImpl(FieldTypeSignature[] ubs, FieldTypeSignature[] lbs, GenericsFactory f) {
-        throw VMError.shouldNotReachHere("sun.reflect.generics.reflectiveObjects.WildcardTypeImpl constructor was removed." +
-                        "All the WildcardTypeImpl objects should be allocated at image build time and cached in the native image heap.");
-    }
-
     @Substitute
     public Type[] getUpperBounds() {
         if (JavaVersionUtil.JAVA_SPEC <= 8) {
