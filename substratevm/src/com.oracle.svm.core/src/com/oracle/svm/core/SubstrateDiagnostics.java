@@ -77,7 +77,6 @@ import com.oracle.svm.core.threadlocal.FastThreadLocalBytes;
 import com.oracle.svm.core.threadlocal.FastThreadLocalFactory;
 import com.oracle.svm.core.threadlocal.VMThreadLocalInfos;
 import com.oracle.svm.core.util.Counter;
-import com.oracle.svm.core.util.VMError;
 
 public class SubstrateDiagnostics {
     private static final FastThreadLocalBytes<CCharPointer> threadOnlyAttachedForCrashHandler = FastThreadLocalFactory.createBytes(() -> 1);
@@ -144,10 +143,8 @@ public class SubstrateDiagnostics {
         int numDiagnosticThunks = DiagnosticThunkRegister.getSingleton().size();
         for (int i = 0; i < numDiagnosticThunks; i++) {
             DiagnosticThunk thunk = DiagnosticThunkRegister.getSingleton().getThunk(i);
-            int diagnosticLevel = DiagnosticThunkRegister.getSingleton().getDefaultDiagnosticLevel(i) & DiagnosticLevel.SAFE;
-            if (diagnosticLevel != DiagnosticLevel.DISABLED) {
-                thunk.printDiagnostics(log, errorContext, diagnosticLevel, 1);
-            }
+            int invocationCount = DiagnosticThunkRegister.getSingleton().getInitialInvocationCount(i);
+            thunk.printDiagnostics(log, errorContext, DiagnosticLevel.SAFE, invocationCount);
         }
     }
 
@@ -205,15 +202,18 @@ public class SubstrateDiagnostics {
         while (fatalErrorState.diagnosticThunkIndex < numDiagnosticThunks) {
             int index = fatalErrorState.diagnosticThunkIndex;
             DiagnosticThunk thunk = DiagnosticThunkRegister.getSingleton().getThunk(index);
-            int diagnosticLevel = DiagnosticThunkRegister.getSingleton().getDefaultDiagnosticLevel(index);
-            if (diagnosticLevel != DiagnosticLevel.DISABLED) {
-                while (++fatalErrorState.invocationCount <= thunk.maxInvocations()) {
-                    try {
-                        thunk.printDiagnostics(log, errorContext, diagnosticLevel, fatalErrorState.invocationCount);
-                        break;
-                    } catch (Throwable e) {
-                        dumpException(log, thunk, e);
-                    }
+
+            // Start at the configured initial invocation count.
+            if (fatalErrorState.invocationCount == 0) {
+                fatalErrorState.invocationCount = DiagnosticThunkRegister.getSingleton().getInitialInvocationCount(index) - 1;
+            }
+
+            while (++fatalErrorState.invocationCount <= thunk.maxInvocations()) {
+                try {
+                    thunk.printDiagnostics(log, errorContext, DiagnosticLevel.FULL, fatalErrorState.invocationCount);
+                    break;
+                } catch (Throwable e) {
+                    dumpException(log, thunk, e);
                 }
             }
 
@@ -295,39 +295,56 @@ public class SubstrateDiagnostics {
         }
     }
 
-    public static void updateDiagnosticLevels(String thunks) {
+    public static void updateInitialInvocationCounts(String configuration) throws IllegalArgumentException {
         int pos = 0;
         int end;
-        while ((end = thunks.indexOf(',', pos)) >= 0) {
-            String entry = thunks.substring(pos, end);
-            updateDiagnosticLevel(entry);
+        while ((end = configuration.indexOf(',', pos)) >= 0) {
+            String entry = configuration.substring(pos, end);
+            updateInitialInvocationCount(entry);
             pos = end + 1;
         }
 
-        String entry = thunks.substring(pos);
-        updateDiagnosticLevel(entry);
+        String entry = configuration.substring(pos);
+        updateInitialInvocationCount(entry);
     }
 
-    private static void updateDiagnosticLevel(String entry) {
+    private static void updateInitialInvocationCount(String entry) throws IllegalArgumentException {
         int pos = entry.indexOf(':');
         if (pos <= 0 || pos == entry.length() - 1) {
-            throw VMError.shouldNotReachHere("Invalid value specified for " + SubstrateOptions.DiagnosticDetails.getValue() + ": '" + entry + "'");
+            throw new IllegalArgumentException("'" + entry + "' has an invalid format.");
         }
 
         String pattern = entry.substring(0, pos);
-        int level = DiagnosticLevel.fromDiagnosticDetails(entry.substring(pos + 1));
+        int initialInvocationCount = parseInvocationCount(entry, pos);
 
-        int numDiagnosticThunks = DiagnosticThunkRegister.getSingleton().size();
         int matches = 0;
+        int numDiagnosticThunks = DiagnosticThunkRegister.getSingleton().size();
         for (int i = 0; i < numDiagnosticThunks; i++) {
             DiagnosticThunk thunk = DiagnosticThunkRegister.getSingleton().getThunk(i);
+            // Checkstyle: allow Class.getSimpleName
             if (matches(thunk.getClass().getSimpleName(), pattern)) {
-                DiagnosticThunkRegister.getSingleton().setDiagnosticLevel(i, level);
+                // Checkstyle: disallow Class.getSimpleName
+                DiagnosticThunkRegister.getSingleton().setInitialInvocationCount(i, initialInvocationCount);
                 matches++;
             }
         }
 
-        VMError.guarantee(matches > 0, "The following pattern did not match any diagnostic thunk: '" + entry + "'");
+        if (matches == 0) {
+            throw new IllegalArgumentException("the pattern '" + entry + "' not match any diagnostic thunk.");
+        }
+    }
+
+    private static int parseInvocationCount(String entry, int pos) {
+        int initialInvocationCount = 0;
+        try {
+            initialInvocationCount = Integer.parseInt(entry.substring(pos + 1));
+        } catch (NumberFormatException e) {
+        }
+
+        if (initialInvocationCount < 1) {
+            throw new IllegalArgumentException("'" + entry + "' does not specify an integer value >= 1.");
+        }
+        return initialInvocationCount;
     }
 
     private static boolean matches(String text, String pattern) {
@@ -337,11 +354,21 @@ public class SubstrateDiagnostics {
 
     private static boolean matches(String text, int textPos, String pattern, int patternPos) {
         while (textPos < text.length()) {
-            if (pattern.charAt(patternPos) == '*') {
-                while (!matches(text, textPos, pattern, patternPos + 1) && textPos < text.length()) {
+            if (patternPos >= pattern.length()) {
+                return false;
+            } else if (pattern.charAt(patternPos) == '*') {
+                // Wildcard at the end of the pattern matches everything.
+                if (patternPos + 1 >= pattern.length()) {
+                    return true;
+                }
+
+                while (textPos < text.length()) {
+                    if (matches(text, textPos, pattern, patternPos + 1)) {
+                        return true;
+                    }
                     textPos++;
                 }
-                return textPos < text.length();
+                return false;
             } else if (text.charAt(textPos) == pattern.charAt(patternPos)) {
                 textPos++;
                 patternPos++;
@@ -350,6 +377,7 @@ public class SubstrateDiagnostics {
             }
         }
 
+        // Filter wildcards at the end of the pattern in case we ran out of text.
         while (patternPos < pattern.length() && pattern.charAt(patternPos) == '*') {
             patternPos++;
         }
@@ -362,11 +390,13 @@ public class SubstrateDiagnostics {
         volatile int invocationCount;
 
         Log log;
-        byte[] errorContextData;
+        private byte[] errorContextData;
 
         @Platforms(Platform.HOSTED_ONLY.class)
         PrintDiagnosticsState() {
             int errorContextSize = SizeOf.get(ErrorContext.class);
+            diagnosticThunkIndex = 0;
+            invocationCount = 0;
             errorContextData = new byte[errorContextSize];
         }
 
@@ -419,7 +449,7 @@ public class SubstrateDiagnostics {
             boolean printLocationInfo = invocationCount < 4;
             boolean allowJavaHeapAccess = DiagnosticLevel.javaHeapAccessAllowed(maxDiagnosticLevel) && invocationCount < 3;
             boolean allowUnsafeOperations = DiagnosticLevel.unsafeOperationsAllowed(maxDiagnosticLevel) && invocationCount < 2;
-            if (context.isNonNull()) {
+            if (context.getRegisterContext().isNonNull()) {
                 log.string("General purpose register values:").indent(true);
                 RegisterDumper.singleton().dumpRegisters(log, context.getRegisterContext(), printLocationInfo, allowJavaHeapAccess, allowUnsafeOperations);
                 log.indent(false);
@@ -799,21 +829,6 @@ public class SubstrateDiagnostics {
         public static boolean unsafeOperationsAllowed(int level) {
             return level >= 2;
         }
-
-        public static int fromDiagnosticDetails(String details) {
-            switch (details) {
-                case "0":
-                    return DISABLED;
-                case "1":
-                    return MINIMAL;
-                case "2":
-                    return SAFE;
-                case "3":
-                    return FULL;
-                default:
-                    throw new IllegalArgumentException();
-            }
-        }
     }
 
     @RawStructure
@@ -864,7 +879,7 @@ public class SubstrateDiagnostics {
 
     public static class DiagnosticThunkRegister {
         private DiagnosticThunk[] diagnosticThunks;
-        private int[] defaultDiagnosticLevel;
+        private int[] initialInvocationCount;
 
         /**
          * Get the register.
@@ -887,7 +902,7 @@ public class SubstrateDiagnostics {
                             new DumpThreads(), new DumpCurrentThreadLocals(), new DumpCurrentVMOperation(), new DumpVMOperationHistory(), new DumpCodeCacheHistory(),
                             new DumpRuntimeCodeInfoMemory(), new DumpRecentDeoptimizations(), new DumpCounters(), new DumpCurrentThreadFrameAnchors(), new DumpCurrentThreadDecodedStackTrace(),
                             new DumpOtherStackTraces(), new VMLockSupport.DumpVMMutexes()};
-            this.defaultDiagnosticLevel = new int[diagnosticThunks.length];
+            this.initialInvocationCount = new int[diagnosticThunks.length];
         }
 
         /**
@@ -899,8 +914,8 @@ public class SubstrateDiagnostics {
             diagnosticThunks = Arrays.copyOf(diagnosticThunks, diagnosticThunks.length + 1);
             diagnosticThunks[diagnosticThunks.length - 1] = diagnosticThunk;
 
-            defaultDiagnosticLevel = Arrays.copyOf(defaultDiagnosticLevel, defaultDiagnosticLevel.length + 1);
-            defaultDiagnosticLevel[defaultDiagnosticLevel.length - 1] = DiagnosticLevel.FULL;
+            initialInvocationCount = Arrays.copyOf(initialInvocationCount, initialInvocationCount.length + 1);
+            initialInvocationCount[initialInvocationCount.length - 1] = 1;
         }
         /* Checkstyle: disallow synchronization. */
 
@@ -913,12 +928,12 @@ public class SubstrateDiagnostics {
             return diagnosticThunks[index];
         }
 
-        int getDefaultDiagnosticLevel(int index) {
-            return defaultDiagnosticLevel[index];
+        int getInitialInvocationCount(int index) {
+            return initialInvocationCount[index];
         }
 
-        void setDiagnosticLevel(int index, int value) {
-            defaultDiagnosticLevel[index] = value;
+        void setInitialInvocationCount(int index, int value) {
+            initialInvocationCount[index] = value;
         }
     }
 }

@@ -24,12 +24,11 @@
  */
 package com.oracle.svm.core.locks;
 
-import com.oracle.svm.core.SubstrateDiagnostics.ErrorContext;
 import org.graalvm.nativeimage.ImageSingletons;
 import org.graalvm.nativeimage.IsolateThread;
 
-import com.oracle.svm.core.SubstrateDiagnostics;
 import com.oracle.svm.core.SubstrateDiagnostics.DiagnosticThunk;
+import com.oracle.svm.core.SubstrateDiagnostics.ErrorContext;
 import com.oracle.svm.core.annotate.RestrictHeapAccess;
 import com.oracle.svm.core.log.Log;
 
